@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ECG Medical Canvas Spike - 1D CAM</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #121212;
+      color: #e0e0e0;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+    }
+    .panel {
+      width: 1024px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background-color: #1e1e1e;
+      padding: 12px 20px;
+      border-radius: 8px;
+      border: 1px solid #333;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    select, input[type="file"] {
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #fff;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .badge {
+      background: #2a1515;
+      border: 1px solid #ff4d4f;
+      color: #ff7875;
+      padding: 6px 14px;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .canvas-wrapper {
+      border: 1px solid #444;
+      border-radius: 4px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+      background: #fff7f2;
+      overflow-x: auto;
+      max-width: 100%;
+    }
+    canvas {
+      display: block;
+    }
+    .legend {
+      width: 1024px;
+      font-size: 12px;
+      color: #888;
+      display: flex;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="panel">
+    <div class="controls">
+      <label for="leadSelect"><strong>Derivación:</strong></label>
+      <select id="leadSelect"></select>
+      <input type="file" id="fileInput" accept=".json" title="Cargar JSON alternativo" />
+    </div>
+    <div id="diagBadge" class="badge">Buscando muestra...</div>
+  </div>
+
+  <div class="canvas-wrapper">
+    <canvas id="ecgCanvas" width="1024" height="320"></canvas>
+  </div>
+
+  <div class="legend">
+    <span>Escala: 25 mm/s | 10 mm/mV (1 mm = 4 px)</span>
+    <span>Sombreado rojo: Regiones de atención diagnóstica (CAM 1D)</span>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("ecgCanvas");
+    const ctx = canvas.getContext("2d");
+    const leadSelect = document.getElementById("leadSelect");
+    const diagBadge = document.getElementById("diagBadge");
+    const fileInput = document.getElementById("fileInput");
+
+    // Calibración de cuadrícula médica estandarizada:
+    // 1 mm = 4 px
+    // Subdivisión pequeña (1 mm): 0.04 s / 0.1 mV
+    // Subdivisión grande (5 mm):  0.20 s / 0.5 mV
+    const PX_PER_MM = 4;
+    const SMALL_GRID = 1 * PX_PER_MM; // 4 px
+    const LARGE_GRID = 5 * PX_PER_MM; // 20 px
+    const BASELINE_Y = 160;
+
+    let ecgData = null;
+
+    // 1. Dibujar la cuadrícula médica
+    function drawGrid() {
+      ctx.fillStyle = "#fff7f2"; // Fondo cálido estilo papel milimetrado
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Líneas de 1 mm
+      ctx.lineWidth = 0.5;
+      ctx.strokeStyle = "rgba(255, 170, 160, 0.4)";
+      ctx.beginPath();
+      for (let x = 0; x <= canvas.width; x += SMALL_GRID) {
+        ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height);
+      }
+      for (let y = 0; y <= canvas.height; y += SMALL_GRID) {
+        ctx.moveTo(0, y); ctx.lineTo(canvas.width, y);
+      }
+      ctx.stroke();
+
+      // Líneas de 5 mm
+      ctx.lineWidth = 1.0;
+      ctx.strokeStyle = "rgba(235, 100, 90, 0.55)";
+      ctx.beginPath();
+      for (let x = 0; x <= canvas.width; x += LARGE_GRID) {
+        ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height);
+      }
+      for (let y = 0; y <= canvas.height; y += LARGE_GRID) {
+        ctx.moveTo(0, y); ctx.lineTo(canvas.width, y);
+      }
+      ctx.stroke();
+    }
+
+    function render() {
+        if (!ecgData) return;
+        drawGrid();
+
+        const leadName = leadSelect.value;
+        const signal = ecgData.leads[leadName];
+        const camWeights = ecgData.cam.weights;
+        const totalSamples = signal.length; // 4096 puntos
+
+        const samplesPerPixel = totalSamples / canvas.width;
+
+        // A. Calcular rango dinámico (Min-Max) para eliminar el piso constante
+        const minCam = Math.min(...camWeights);
+        const maxCam = Math.max(...camWeights);
+        const camRange = (maxCam - minCam) || 1;
+
+        // Capa 1: Franja térmica de atención explicable (XAI) 
+        for (let x = 0; x < canvas.width; x++) {
+            const sampleIdx = Math.floor(x * samplesPerPixel);
+            const rawWeight = camWeights[sampleIdx] || 0;
+
+            // 1. Normalización Min-Max (lleva el mínimo relativo a 0)
+            let norm = (rawWeight - minCam) / camRange;
+
+            // 2. Expansión de contraste (potencia cúbica para apagar el fondo y resaltar picos)
+            norm = Math.pow(norm, 3.0);
+
+            // 3. Umbral dinámico para mostrar solo las zonas de alta relevancia (> 30%)
+            if (norm > 0.25) {
+            // Paleta térmica: Transición de naranja brillante a rojo intenso
+            const g = Math.floor(180 * (1 - norm));
+            const alpha = 0.15 + (norm * 0.45);
+            ctx.fillStyle = `rgba(235, ${g}, 20, ${alpha})`;
+            ctx.fillRect(x, 0, 1, canvas.height);
+        }
+    }
+
+    // Capa 2: Trazo vectorial del ECG calibrado (10 mm/mV estándar)
+    ctx.beginPath();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "#081326";
+
+    // Factor de ganancia vertical:
+    // Si la señal está en mV -> 1 mV = 10 mm = 40 px
+    // Si la señal está en 0.1 mV (escala Ribeiro) -> 1 unidad = 4 px (ajustar con multiplicador si luce plano)
+    const GAIN = 4.0; // Prueba subir a 12.0 o 20.0 si la señal se ve muy pequeña
+
+    for (let x = 0; x < canvas.width; x++) {
+        const sampleIdx = Math.floor(x * samplesPerPixel);
+        const rawValue = signal[sampleIdx];
+
+        const y = BASELINE_Y - (rawValue * GAIN);
+
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    }
+    // 3. Inicialización del dataset cargado
+    function loadDataset(data) {
+      ecgData = data;
+      const currentSelected = leadSelect.value;
+      leadSelect.innerHTML = "";
+
+      Object.keys(data.leads).forEach(lead => {
+        const opt = document.createElement("option");
+        opt.value = lead;
+        opt.textContent = lead;
+        leadSelect.appendChild(opt);
+      });
+
+      // Priorizar V1 o restaurar selección previa
+      leadSelect.value = (currentSelected && data.leads[currentSelected]) ? currentSelected : "V1";
+
+      const targetPat = data.cam.target_class;
+      const targetProb = (data.probabilities[targetPat] * 100).toFixed(1);
+      diagBadge.textContent = `Alerta: ${targetPat} (${targetProb}%)`;
+
+      render();
+    }
+
+    leadSelect.addEventListener("change", render);
+
+    // Carga alternativa mediante explorador de archivos local
+    fileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (evt) => loadDataset(JSON.parse(evt.target.result));
+      reader.readAsText(file);
+    });
+
+    // Carga inicial directa apuntando a samples/
+    fetch("../../samples/patient_1_lbbb.json")
+      .then(res => {
+        if (!res.ok) throw new Error("No se pudo cargar el archivo por fetch");
+        return res.json();
+      })
+      .then(data => loadDataset(data))
+      .catch(() => {
+        diagBadge.textContent = "Usa el botón de archivo para cargar patient_1_lbbb.json";
+        drawGrid();
+      });
+  </script>
+</body>
+</html>

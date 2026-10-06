@@ -45,7 +45,6 @@ pnpm-debug.log*
 *.sublime-workspace
 
 .antigravity/
-*.md
 AGENTS.md
 !README.md
 !/README.md

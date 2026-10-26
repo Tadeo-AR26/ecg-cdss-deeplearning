@@ -1,4 +1,27 @@
-﻿# Machine Learning and XAI Technical Specification
+# Machine Learning and XAI Technical Specification
+
+## 0. Dual-Model Pipeline Overview
+
+The system operates a **hierarchical two-model pipeline**. Both models run under `onnxruntime`; neither imports TensorFlow or Keras in production.
+
+| Property              | Primary Model (PTB-XL)                               | Subordinate Model (Ribeiro ResNet-1D)                |
+|-----------------------|------------------------------------------------------|------------------------------------------------------|
+| **Dataset**           | PTB-XL (21,837 records, 12-lead, 500 Hz → resampled) | CODE-15% (≈400k records, 12-lead, 400 Hz)            |
+| **Output labels**     | MI, STTC, HYP, WPW, LNGQT                           | 1dAVb, RBBB, LBBB, AF, SB, ST                       |
+| **Role**              | Always runs; direct diagnosis + threshold gating     | Conditional; refines rhythm when T = True            |
+| **Explainability**    | —                                                    | 1D CAM (Flatten-based; see §3)                       |
+| **Invocation rule**   | Mandatory on every ECG input                         | Only when P_CD, P_AFIB, P_SBRAD, or P_STACH > τ     |
+
+### Gate condition (evaluated after PTB-XL inference):
+
+```python
+T = (P_CD > τ_CD) or (P_AFIB > τ_AFIB) or (P_SBRAD > τ_SBRAD) or (P_STACH > τ_STACH)
+# T = True  → Run Ribeiro ONNX inference
+# T = False → Skip Ribeiro; finalize with PTB-XL outputs only
+```
+
+---
+
 
 ## 1. Ribeiro ResNet-1D Model Architecture
 
@@ -101,4 +124,65 @@ For a target class $c$ (e.g., $c = 2$ for LBBB):
   To avoid uniform red backgrounds in sustained pathologies across every beat (e.g., bundle branch blocks):
   - Local normalization: $\text{norm} = \frac{\text{cam} - \min(\text{cam})}{\max(\text{cam}) - \min(\text{cam})}$
   - Non-linear contrast: $\text{norm}^3$ (amplifies ventricular peaks and attenuates the baseline)
-  - Render threshold: Display thermal shading only if $\text{norm} > 0.25$.
+  - Render threshold: Display thermal shading only if $\text{norm} > 0.25$.
+
+---
+
+## 6. Class Imbalance: PTB-XL Label Distribution and Mitigation Strategies
+
+### 6.1 Known Imbalance in PTB-XL Output Labels
+
+The PTB-XL primary model covers five diagnostic super-classes. Some are severely underrepresented:
+
+| Label | Full Name                    | Approx. Records | Approx. % of Total | Risk Level   |
+|-------|------------------------------|----------------|--------------------|--------------|
+| MI    | Myocardial Infarction        | ~5,000         | ~23%               | Low          |
+| STTC  | ST/T-Change                  | ~5,200         | ~24%               | Low          |
+| HYP   | Hypertrophy                  | ~2,500         | ~12%               | Medium       |
+| LNGQT | Long QT Syndrome             | ~200–400       | ~1–2%              | High         |
+| WPW   | Wolff-Parkinson-White        | **~120**       | **~0.6%**          | **Very High** |
+
+> **Note:** Values are approximations based on PTB-XL v1.0.3 superdiagnostic label counts. Always verify against the active dataset split.
+
+### 6.2 Mandatory Training Mitigations
+
+The following mitigations **must** be applied when training or fine-tuning the PTB-XL primary model:
+
+1. **Weighted Loss Function:**
+   Use binary cross-entropy with per-class positive weights:
+   $$\text{pos\_weight}_c = \frac{N_{\text{neg},c}}{N_{\text{pos},c}}$$
+   This is critical for WPW, where the ratio can exceed 170:1.
+
+   ```python
+   # Example for PyTorch
+   pos_weight = torch.tensor([w_MI, w_STTC, w_HYP, w_LNGQT, w_WPW])
+   criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+   ```
+
+2. **Stratified Train/Val/Test Splits:**
+   Multi-label stratification (e.g., `iterative-stratification` library) must be used. Simple random splits risk entire minority classes (WPW) being absent from validation or test sets.
+
+3. **Signal-Level Data Augmentation for Minority Classes:**
+   Apply augmentation only to minority class records during training:
+   - Gaussian noise injection ($\sigma$ ≤ 0.02 mV)
+   - Amplitude scaling (factor ∈ [0.85, 1.15])
+   - Baseline wander (low-frequency sinusoidal drift)
+   - **Do NOT** use time-shifting or lead swapping for WPW; they may destroy the delta wave morphology.
+
+4. **Per-Class Decision Threshold Tuning:**
+   After training, sweep thresholds on the validation set independently per class:
+   $$\hat{\tau}_c = \arg\max_{\tau \in [0,1]} F1_c(\tau)$$
+   Default threshold of 0.5 is inappropriate for WPW and LNGQT.
+
+5. **Evaluation Protocol:**
+   Report all of the following; do not report only accuracy:
+   - Per-class AUROC
+   - Per-class F1, Precision, Recall at tuned threshold
+   - Normalized confusion matrix (row-normalized to reveal class-level recall)
+   - Macro-averaged and weighted-averaged F1
+
+### 6.3 Imbalance in the Ribeiro Subordinate Model
+
+The Ribeiro model (trained on CODE-15%) has its own label distribution. Its labels (1dAVb, RBBB, LBBB, AF, SB, ST) are generally more balanced due to the large dataset size (~400k records). Nevertheless:
+- **AF** (Atrial Fibrillation) may still be a minority relative to SB/ST in some partitions.
+- Because the Ribeiro model is invoked conditionally (only when T = True), the **effective input distribution during inference** is already pre-filtered toward rhythm-abnormal ECGs, which may shift its operating point. This must be considered when selecting the inference decision thresholds for the Ribeiro model's outputs.

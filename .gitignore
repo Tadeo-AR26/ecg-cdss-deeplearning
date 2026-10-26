@@ -57,3 +57,18 @@ Desktop.ini
 $RECYCLE.BIN/
 .DS_Store
 *.onnx
+
+# ==========================================
+# PTB-XL training artifacts
+# ==========================================
+ml/ptbxl/checkpoints/*
+ml/ptbxl/runs/*
+!ml/ptbxl/checkpoints/.gitkeep
+!ml/ptbxl/runs/.gitkeep
+*.ckpt
+*.pt
+*.pth
+ml/ptbxl/plots/
+*.ps1
+sysarch_en.md
+/docs/*.txt

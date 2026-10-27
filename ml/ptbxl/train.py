@@ -3,6 +3,13 @@ import os
 import sys
 import numpy as np
 import tensorflow as tf
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score,
+    precision_recall_fscore_support,
+    average_precision_score,
+    multilabel_confusion_matrix,
+)
 
 # Configure UTF-8 stdout for Windows
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -39,6 +46,128 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Quick test run with 2 epochs")
     return parser.parse_args()
 
+class BinaryFocalLoss(tf.keras.losses.Loss):
+    def __init__(self, gamma=2.0, alpha=0.25, name="binary_focal_loss"):
+        super().__init__(name=name)
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        # Avoid numeric instability with log(0) and log(1)
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+
+        # p_t: probability assigned to the ground-truth class
+        # For positives:  p_t = y_pred
+        # For negatives:  p_t = 1 - y_pred  (NOT epsilon — that was a bug)
+        p_t = tf.where(tf.equal(y_true, 1.0), y_pred, 1.0 - y_pred)
+
+        # Alpha balance weight (alpha for positives, 1-alpha for negatives)
+        alpha_factor = tf.where(tf.equal(y_true, 1.0), self.alpha, 1.0 - self.alpha)
+
+        # Focal modulation term: (1 - p_t)^gamma down-weights easy examples
+        focal_weight = alpha_factor * tf.pow(1.0 - p_t, self.gamma)
+
+        # Standard Binary Cross-Entropy over the ground-truth class probability
+        bce = -tf.math.log(p_t)
+        loss = focal_weight * bce
+
+        return tf.reduce_mean(loss)
+
+
+def find_optimal_thresholds(y_true, y_pred_probs, class_names, grid_size=91):
+    thresholds = np.linspace(0.05, 0.95, grid_size)
+    optimal_thresholds = {}
+
+    print("\n" + "=" * 65)
+    print("  OPTIMAL THRESHOLD SWEEP (VAL SET - F1-MAXIMIZATION)")
+    print("=" * 65)
+    print(f"  {'Class':<10} | {'Opt Thresh':<10} | {'Val F1':<8} | {'Precision':<10} | {'Recall':<8}")
+    print("  " + "-" * 61)
+
+    for i, cls_name in enumerate(class_names):
+        y_t = y_true[:, i]
+        y_p = y_pred_probs[:, i]
+
+        best_thresh = 0.5
+        best_f1 = -1.0
+        best_prec = 0.0
+        best_rec = 0.0
+
+        for thresh in thresholds:
+            y_pred_bin = (y_p >= thresh).astype(int)
+            prec, rec, f1, _ = precision_recall_fscore_support(
+                y_t, y_pred_bin, average='binary', zero_division=0
+            )
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresh = thresh
+                best_prec = prec
+                best_rec = rec
+        
+        optimal_thresholds[cls_name] = float(best_thresh)
+        print(f"  {cls_name:<10} | {best_thresh:<10.2f} | {best_f1:<8.4f} | {best_prec:<10.4f} | {best_rec:<8.4f}")
+
+    print("=" * 65)
+    return optimal_thresholds
+
+def evaluate_on_test_set(model, X_test, y_test, class_names, thresholds, batch_size=BATCH_SIZE):
+    print("\n[*] Predicting on Test set...")
+    y_test_probs = model.predict(X_test, batch_size=batch_size, verbose=0)
+
+    y_test_pred_bin = np.zeros_like(y_test_probs)
+    for i, cls_name in enumerate(class_names):
+        thresh = thresholds[cls_name]
+        y_test_pred_bin[:, i] = (y_test_probs[:, i] >= thresh).astype(int)
+    
+    print("\n" + "=" * 65)
+    print("  FINAL TEST SET EVALUATION (OPTIMIZED THRESHOLDS)")
+    print("=" * 65)
+    print(f"  {'Class':<10} | {'ROC-AUC':<8} | {'PR-AUC':<8} | {'Precision':<10} | {'Recall':<8} | {'F1-Score':<8}")
+    print("  " + "-" * 63)
+
+    for i, cls_name in enumerate(class_names):
+        y_t = y_test[:, i]
+        y_p = y_test_probs[:, i]
+        y_b = y_test_pred_bin[:, i]
+
+        roc_auc = roc_auc_score(y_t, y_p) if np.sum(y_t) > 0 else 0.0
+        pr_auc = average_precision_score(y_t, y_p) if np.sum(y_t) > 0 else 0.0
+        prec, rec, f1, _ = precision_recall_fscore_support(y_t, y_b, average='binary', zero_division=0)
+        print(f"  {cls_name:<10} | {roc_auc:<8.4f} | {pr_auc:<8.4f} | {prec:<10.4f} | {rec:<8.4f} | {f1:<8.4f}")
+    
+    print("=" * 65)
+
+    print("\n[*] Detailed Classification Report (Test Set):")
+    print(classification_report(y_test, y_test_pred_bin, target_names=class_names, zero_division=0))
+
+    # Per-class confusion matrix: multilabel_confusion_matrix returns shape (n_classes, 2, 2)
+    # Layout per class:
+    #   [[TN  FP]
+    #    [FN  TP]]
+    # Key metrics to look for:
+    #   - TP (True Positives):  correctly flagged as positive — want HIGH, especially for WPW/LNGQT
+    #   - FN (False Negatives): missed positives (dangerous in clinical context) — want LOW
+    #   - FP (False Positives): false alarms — acceptable trade-off to reduce FN
+    #   - TN (True Negatives):  correctly rejected — usually high due to class imbalance
+    cm_all = multilabel_confusion_matrix(y_test, y_test_pred_bin)
+
+    print("\n" + "=" * 65)
+    print("  PER-CLASS CONFUSION MATRIX (Test Set)")
+    print("=" * 65)
+    for i, cls_name in enumerate(class_names):
+        tn, fp, fn, tp = cm_all[i].ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # Recall / True Positive Rate
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # True Negative Rate
+        ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0           # Precision / Positive Predictive Value
+        npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0           # Negative Predictive Value
+        print(f"  [{cls_name}]")
+        print(f"    Matrix:  [[TN={tn:4d}  FP={fp:4d}]]")
+        print(f"             [[FN={fn:4d}  TP={tp:4d}]]")
+        print(f"    Sensitivity (Recall): {sensitivity:.4f}  |  Specificity: {specificity:.4f}")
+        print(f"    PPV (Precision):       {ppv:.4f}  |  NPV:         {npv:.4f}")
+        print()
 
 def main() -> None:
     args = parse_args()
@@ -90,26 +219,26 @@ def main() -> None:
     model = build_ribeiro_resnet1d(num_classes=len(TARGET_CLASSES))
     model.summary()
 
-    # ============================================================
-    # TODO FOR USER:
-    # 1. Customize your Loss Function:
-    #    Standard binary_crossentropy works as baseline, but for
-    #    severe imbalance (WPW, LNGQT), consider:
-    #      - Weighted Binary Crossentropy using `pos_weights`
-    #      - Focal Loss
-    # ============================================================
-    loss_fn = tf.keras.losses.BinaryCrossentropy()
+    # Standard baseline (no imbalance correction):
+    # loss_fn = tf.keras.losses.BinaryCrossentropy()
 
-    # 2. Customize Optimizer & Metrics:
+    # Focal Loss — recommended for severe imbalance (WPW pos_weight ~271, LNGQT ~184)
+    loss_fn = BinaryFocalLoss(gamma=2.0, alpha=0.25)
+
+    # Alternative: weighted BCE with per-class pos_weight tensor
+    # loss_fn = WeightedBCEWithSigmoid(pos_weights=pos_weights, max_clip=30.0)
+
+    # 5. Configure Optimizer & Metrics:
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
     metrics = [
-        tf.keras.metrics.BinaryAccuracy(name="accuracy"),
+        tf.keras.metrics.BinaryAccuracy(name="accuracy", threshold=0.5),
         tf.keras.metrics.AUC(name="auc", multi_label=True),
+        tf.keras.metrics.AUC(name="pr_auc", curve="PR", multi_label=True),
     ]
 
     model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
 
-    # 4. Callbacks setup
+    # 6. Callbacks setup
     checkpoint_path = os.path.join(CHECKPOINTS_DIR, "best_model.keras")
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
@@ -152,7 +281,34 @@ def main() -> None:
     print("\n[+] Training completed.")
     print(f"[+] Best model checkpoint saved to: {checkpoint_path}")
 
-    # TODO: Add your post-training evaluation / threshold tuning here
+    # 7. Post-training evaluation with per-class threshold calibration
+
+    # Load the best checkpoint saved by ModelCheckpoint
+    print("\n[*] Loading best model weights for evaluation...")
+    best_model = tf.keras.models.load_model(
+        checkpoint_path,
+        custom_objects={'BinaryFocalLoss': BinaryFocalLoss},
+    )
+
+    # Predict on Validation set to find optimal decision thresholds per class
+    print("[*] Generating predictions on Validation set...")
+    y_val_probs = best_model.predict(X_val, batch_size=batch_size, verbose=0)
+
+    optimal_thresholds = find_optimal_thresholds(
+        y_true=y_val,
+        y_pred_probs=y_val_probs,
+        class_names=TARGET_CLASSES,
+    )
+
+    # Final evaluation on Test set using calibrated per-class thresholds
+    evaluate_on_test_set(
+        model=best_model,
+        X_test=X_test,
+        y_test=y_test,
+        class_names=TARGET_CLASSES,
+        thresholds=optimal_thresholds,
+        batch_size=batch_size,
+    )
 
 
 if __name__ == "__main__":

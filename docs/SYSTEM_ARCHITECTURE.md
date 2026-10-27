@@ -84,8 +84,9 @@ PG/
 +-- backend/
 |   +-- models/
 |   |   +-- ribeiro_dual.onnx       # Compiled Ribeiro model with dual graph (~25.7 MB)
-|   |   +-- ptbxl_primary.onnx      # Compiled PTB-XL primary model (planned)
+|   |   +-- ptbxl_dual.onnx         # Compiled PTB-XL model with dual graph
 |   |   +-- dense_weights.npy       # Ribeiro dense layer weight matrix (5120, 6)
+|   |   +-- ptbxl_dense_weights.npy # PTB-XL dense layer weight matrix (5120, C)
 |   +-- app/                        # Future FastAPI service
 +-- docs/
 |   +-- SYSTEM_ARCHITECTURE.md      # This document (context for AI agents)
@@ -97,11 +98,18 @@ PG/
 |       +-- test_canvas.html        # Spike 2: ECG Canvas viewer with thermal CAM
 +-- ml/
 |   +-- data/
+|   |   +-- ptbxl/                  # PTB-XL WFDB dataset (records100/500, CSVs)
 |   |   +-- ecg_tracings.hdf5       # Test dataset (GIT IGNORED)
+|   +-- ptbxl/
+|   |   +-- config.py               # PTB-XL configuration & paths
+|   |   +-- dataset.py              # Metadata loader, splits & signal resampler
+|   |   +-- models.py               # Ribeiro ResNet-1D architecture implementation
+|   |   +-- train.py                # Training orchestrator & callbacks
 |   +-- raw/
 |   |   +-- model.hdf5              # Original Ribeiro Keras weights (GIT IGNORED)
 |   +-- scripts/
 |   |   +-- export_dual_onnx.py     # Keras -> Dual ONNX compilation pipeline (Ribeiro)
+|   |   +-- export_ptbxl_dual_onnx.py # Keras -> Dual ONNX compilation pipeline (PTB-XL)
 |   |   +-- export_sample_json.py   # Static JSON fixture generator
 |   +-- spikes/
 |       +-- test_inference_cam.py   # Spike 1: ONNX validation and CAM inference

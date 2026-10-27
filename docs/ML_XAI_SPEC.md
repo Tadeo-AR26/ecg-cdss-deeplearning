@@ -9,7 +9,8 @@ The system operates a **hierarchical two-model pipeline**. Both models run under
 | **Dataset**           | PTB-XL (21,837 records, 12-lead, 500 Hz → resampled) | CODE-15% (≈400k records, 12-lead, 400 Hz)            |
 | **Output labels**     | MI, STTC, HYP, WPW, LNGQT                           | 1dAVb, RBBB, LBBB, AF, SB, ST                       |
 | **Role**              | Always runs; direct diagnosis + threshold gating     | Conditional; refines rhythm when T = True            |
-| **Explainability**    | —                                                    | 1D CAM (Flatten-based; see §3)                       |
+| **Architecture**      | Ribeiro ResNet-1D (same backbone, dual ONNX)         | Ribeiro ResNet-1D (same backbone, dual ONNX)         |
+| **Explainability**    | 1D CAM (Flatten-based; see §3)                       | 1D CAM (Flatten-based; see §3)                       |
 | **Invocation rule**   | Mandatory on every ECG input                         | Only when P_CD, P_AFIB, P_SBRAD, or P_STACH > τ     |
 
 ### Gate condition (evaluated after PTB-XL inference):

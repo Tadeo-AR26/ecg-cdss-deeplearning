@@ -91,11 +91,11 @@ def export_ptbxl_dual():
 
     num_classes = outputs[0].shape[-1]
     print(f"[OK] Salida 0 (Probabilidades): forma {outputs[0].shape} (esperada: 1, {num_classes})")
-    print(f"[OK] Salida 1 (Feature maps):    forma {outputs[1].shape} (esperada: 1, 16, 320)")
+    print(f"[OK] Salida 1 (Feature maps):    forma {outputs[1].shape}")
 
     assert outputs[0].shape == (1, num_classes), f"Salida 0 inválida: {outputs[0].shape}"
-    assert outputs[1].shape == (1, 16, 320), f"Salida 1 inválida: {outputs[1].shape}"
-    print("[OK] PTB-XL dual ONNX validado e idéntico a Ribeiro.")
+    assert len(outputs[1].shape) == 3 and outputs[1].shape[0] == 1, f"Salida 1 inválida: {outputs[1].shape}"
+    print(f"[OK] PTB-XL dual ONNX validado (canales: {outputs[1].shape[-1]}, resolución temporal: {outputs[1].shape[1]}).")
 
 
 if __name__ == "__main__":

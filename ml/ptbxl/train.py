@@ -1,6 +1,19 @@
 import argparse
 import os
 import sys
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# Disable oneDNN custom ops to prevent DT_BOOL AVX-512 fallback crashes on Windows
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+# Configure UTF-8 stdout for Windows
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 import numpy as np
 import tensorflow as tf
 from sklearn.metrics import (
@@ -10,11 +23,6 @@ from sklearn.metrics import (
     average_precision_score,
     multilabel_confusion_matrix,
 )
-
-# Configure UTF-8 stdout for Windows
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-
 from ml.ptbxl.config import (
     CHECKPOINTS_DIR,
     RUNS_DIR,
@@ -25,11 +33,12 @@ from ml.ptbxl.config import (
     TARGET_CLASSES,
 )
 from ml.ptbxl.dataset import (
+    PTBXLSequence,
     get_data_splits,
     compute_class_weights,
     apply_augmentations,
 )
-from ml.ptbxl.models import build_ribeiro_resnet1d
+from ml.ptbxl.models import build_inception1d, build_ribeiro_resnet1d
 
 
 def set_seed(seed: int = RANDOM_SEED) -> None:
@@ -40,6 +49,13 @@ def set_seed(seed: int = RANDOM_SEED) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PTB-XL Primary ECG Model")
+    parser.add_argument(
+        "--arch",
+        type=str,
+        choices=["inception1d", "resnet1d"],
+        default="inception1d",
+        help="Architecture: 'inception1d' (PTB-XL Benchmark, default) or 'resnet1d' (Ribeiro)",
+    )
     parser.add_argument("--epochs", type=int, default=EPOCHS, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size")
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate")
@@ -58,13 +74,13 @@ class BinaryFocalLoss(tf.keras.losses.Loss):
         epsilon = tf.keras.backend.epsilon()
         y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
 
-        # p_t: probability assigned to the ground-truth class
-        # For positives:  p_t = y_pred
-        # For negatives:  p_t = 1 - y_pred  (NOT epsilon — that was a bug)
-        p_t = tf.where(tf.equal(y_true, 1.0), y_pred, 1.0 - y_pred)
+        # p_t: probability assigned to the ground-truth class (using continuous float algebra)
+        # If y_true == 1 -> p_t = y_pred; if y_true == 0 -> p_t = 1 - y_pred
+        # Eliminates DT_BOOL tensors and oneDNN C++ fallback issues
+        p_t = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
 
         # Alpha balance weight (alpha for positives, 1-alpha for negatives)
-        alpha_factor = tf.where(tf.equal(y_true, 1.0), self.alpha, 1.0 - self.alpha)
+        alpha_factor = y_true * self.alpha + (1.0 - y_true) * (1.0 - self.alpha)
 
         # Focal modulation term: (1 - p_t)^gamma down-weights easy examples
         focal_weight = alpha_factor * tf.pow(1.0 - p_t, self.gamma)
@@ -112,9 +128,12 @@ def find_optimal_thresholds(y_true, y_pred_probs, class_names, grid_size=91):
     print("=" * 65)
     return optimal_thresholds
 
-def evaluate_on_test_set(model, X_test, y_test, class_names, thresholds, batch_size=BATCH_SIZE):
+def evaluate_on_test_set(model, test_data, y_test, class_names, thresholds, batch_size=BATCH_SIZE):
     print("\n[*] Predicting on Test set...")
-    y_test_probs = model.predict(X_test, batch_size=batch_size, verbose=0)
+    if isinstance(test_data, tf.keras.utils.Sequence):
+        y_test_probs = model.predict(test_data, verbose=0)
+    else:
+        y_test_probs = model.predict(test_data, batch_size=batch_size, verbose=0)
 
     y_test_pred_bin = np.zeros_like(y_test_probs)
     for i, cls_name in enumerate(class_names):
@@ -180,6 +199,7 @@ def main() -> None:
     print("=" * 60)
     print("  PTB-XL PRIMARY MODEL — TRAINING SETUP")
     print("=" * 60)
+    print(f"  Architecture : {args.arch.upper()} {'(PTB-XL Benchmark / InceptionTime)' if args.arch == 'inception1d' else '(Ribeiro et al.)'}")
     print(f"  Target Classes ({len(TARGET_CLASSES)}): {TARGET_CLASSES}")
     print(f"  Batch size   : {batch_size}")
     print(f"  Epochs       : {epochs}")
@@ -188,21 +208,21 @@ def main() -> None:
     print(f"  Runs/Logs    : {RUNS_DIR}")
     print("=" * 60)
 
-    # 1. Load Dataset metadata & splits
-    print("\n[*] Loading dataset splits...")
-    splits = get_data_splits(classes=TARGET_CLASSES, load_waveforms=True)
+    # 1. Load Dataset metadata & splits (load_waveforms=False avoids loading ~4.3 GB into RAM)
+    print("\n[*] Loading dataset splits (metadata only)...")
+    splits = get_data_splits(classes=TARGET_CLASSES, load_waveforms=False)
 
-    df_train, y_train_df, X_train = splits["train"]
-    df_val, y_val_df, X_val = splits["val"]
-    df_test, y_test_df, X_test = splits["test"]
+    df_train, y_train_df, _ = splits["train"]
+    df_val, y_val_df, _ = splits["val"]
+    df_test, y_test_df, _ = splits["test"]
 
     y_train = y_train_df.values
     y_val = y_val_df.values
     y_test = y_test_df.values
 
-    print(f"  Train: X={X_train.shape}, y={y_train.shape}")
-    print(f"  Val  : X={X_val.shape}, y={y_val.shape}")
-    print(f"  Test : X={X_test.shape}, y={y_test.shape}")
+    print(f"  Train: {len(df_train)} samples, y={y_train.shape}")
+    print(f"  Val  : {len(df_val)} samples, y={y_val.shape}")
+    print(f"  Test : {len(df_test)} samples, y={y_test.shape}")
 
     # Inspect class distributions
     print("\n[*] Positive cases in Training set:")
@@ -215,8 +235,12 @@ def main() -> None:
     print(f"\n[*] Computed pos_weights: {dict(zip(TARGET_CLASSES, np.round(pos_weights, 2)))}")
 
     # 3. Build Model
-    print("\n[*] Building model...")
-    model = build_ribeiro_resnet1d(num_classes=len(TARGET_CLASSES))
+    if args.arch == "inception1d":
+        print("\n[*] Building Inception-1D model (PTB-XL Benchmark / InceptionTime)...")
+        model = build_inception1d(num_classes=len(TARGET_CLASSES))
+    else:
+        print("\n[*] Building Ribeiro ResNet-1D model...")
+        model = build_ribeiro_resnet1d(num_classes=len(TARGET_CLASSES))
     model.summary()
 
     # Standard baseline (no imbalance correction):
@@ -255,11 +279,11 @@ def main() -> None:
             restore_best_weights=True,
             verbose=1,
         ),
-        tf.keras.callbacks.TensorBoard(
-            log_dir=RUNS_DIR,
-            histogram_freq=1,
-        ),
     ]
+    try:
+        callbacks.append(tf.keras.callbacks.TensorBoard(log_dir=RUNS_DIR, histogram_freq=1))
+    except Exception as e:
+        print(f"[!] Warning: TensorBoard callback could not be initialized: {e}")
 
     # ============================================================
     # TODO FOR USER:
@@ -267,13 +291,16 @@ def main() -> None:
     #   - Threshold sweep per class on validation set (especially WPW)
     #   - Classification report (F1-score per class, AUROC)
     # ============================================================
+    # Data generators (load waveforms dynamically in batches from disk)
+    train_gen = PTBXLSequence(df_train, y_train, batch_size=batch_size, shuffle=True)
+    val_gen = PTBXLSequence(df_val, y_val, batch_size=batch_size, shuffle=False)
+    test_gen = PTBXLSequence(df_test, y_test, batch_size=batch_size, shuffle=False)
+
     print("\n[*] Starting training...")
     history = model.fit(
-        X_train,
-        y_train,
-        validation_data=(X_val, y_val),
+        train_gen,
+        validation_data=val_gen,
         epochs=epochs,
-        batch_size=batch_size,
         callbacks=callbacks,
         verbose=1,
     )
@@ -292,7 +319,7 @@ def main() -> None:
 
     # Predict on Validation set to find optimal decision thresholds per class
     print("[*] Generating predictions on Validation set...")
-    y_val_probs = best_model.predict(X_val, batch_size=batch_size, verbose=0)
+    y_val_probs = best_model.predict(val_gen, verbose=0)
 
     optimal_thresholds = find_optimal_thresholds(
         y_true=y_val,
@@ -303,7 +330,7 @@ def main() -> None:
     # Final evaluation on Test set using calibrated per-class thresholds
     evaluate_on_test_set(
         model=best_model,
-        X_test=X_test,
+        test_data=test_gen,
         y_test=y_test,
         class_names=TARGET_CLASSES,
         thresholds=optimal_thresholds,

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import wfdb
 from typing import Tuple, List, Dict, Optional
+import tensorflow as tf
 
 from scipy.signal import resample
 
@@ -31,10 +32,10 @@ def load_raw_metadata() -> Tuple[pd.DataFrame, pd.DataFrame]:
             f"and scp_statements.csv are present."
         )
 
-    df = pd.read_csv(db_path, index_col="ecg_id")
+    df = pd.read_csv(db_path, index_col="ecg_id", engine="python")
     df["scp_codes"] = df["scp_codes"].apply(ast.literal_eval)
 
-    scp = pd.read_csv(scp_path, index_col=0)
+    scp = pd.read_csv(scp_path, index_col=0, engine="python")
     return df, scp
 
 
@@ -175,3 +176,63 @@ def get_data_splits(
     }
 
     return splits
+
+class PTBXLSequence(tf.keras.utils.Sequence):
+    """
+    Keras Sequence generator that loads ECG records dynamically in batches
+    from disk, preventing out-of-memory errors by never holding the entire
+    dataset waveforms in RAM simultaneously.
+    """
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        targets: np.ndarray,
+        batch_size: int = 64,
+        sampling_rate: int = RAW_SAMPLING_RATE,
+        target_length: int = INPUT_LENGTH,
+        shuffle: bool = True,
+        augment: bool = False,
+    ):
+        super().__init__()
+        self.df = df
+        file_col = "filename_lr" if sampling_rate == 100 else "filename_hr"
+        self.filenames = df[file_col].values
+        self.targets = targets.values if hasattr(targets, "values") else np.asarray(targets)
+        self.batch_size = batch_size
+        self.target_length = target_length
+        self.shuffle = shuffle
+        self.augment = augment
+        self.indices = np.arange(len(self.filenames))
+        self.on_epoch_end()
+
+    def __len__(self) -> int:
+        return int(np.ceil(len(self.filenames) / self.batch_size))
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        batch_indices = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
+        batch_filenames = self.filenames[batch_indices]
+        batch_y = self.targets[batch_indices]
+
+        batch_x = np.empty((len(batch_indices), self.target_length, 12), dtype=np.float32)
+        for i, fname in enumerate(batch_filenames):
+            sig = self._load_single_signal(fname)
+            if self.augment:
+                sig = apply_augmentations(sig, batch_y[i])
+            batch_x[i] = sig
+
+        return batch_x, batch_y
+
+    def _load_single_signal(self, filename: str) -> np.ndarray:
+        filepath = os.path.join(DATA_DIR, filename)
+        record = wfdb.rdrecord(filepath)
+        raw_sig = record.p_signal.astype(np.float32)
+        if np.isnan(raw_sig).any():
+            raw_sig = np.nan_to_num(raw_sig)
+
+        if raw_sig.shape[0] != self.target_length:
+            return resample(raw_sig, self.target_length, axis=0).astype(np.float32)
+        return raw_sig
+
+    def on_epoch_end(self) -> None:
+        if self.shuffle:
+            np.random.shuffle(self.indices)

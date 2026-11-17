@@ -19,8 +19,9 @@ import tf2onnx
 # Project root (dynamically resolved)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# Candidate checkpoint paths for trained PTB-XL model
+# Candidate checkpoint paths for trained PTB-XL model (prefers fine-tuned Stage 2 if available)
 candidate_model_paths = [
+    os.path.join(PROJECT_ROOT, "ml", "ptbxl", "checkpoints", "best_model_stage2b.keras"),
     os.path.join(PROJECT_ROOT, "ml", "ptbxl", "checkpoints", "best_model.keras"),
     os.path.join(PROJECT_ROOT, "ml", "ptbxl", "checkpoints", "best_model.h5"),
 ]

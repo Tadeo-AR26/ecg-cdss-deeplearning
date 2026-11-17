@@ -44,10 +44,10 @@ The pipeline decouples the heavy research ecosystem (TensorFlow/Keras) into a li
 
 ### 2.1 Model Responsibilities
 
-| Layer     | Model              | Output Labels                                          | Trigger     |
-|-----------|--------------------|--------------------------------------------------------|-------------|
-| Primary   | PTB-XL             | MI, STTC, HYP, WPW, LNGQT                             | Always      |
-| Secondary | Ribeiro ResNet-1D  | 1dAVb, RBBB, LBBB, AF (AFIB), SB (SBRAD), ST (STACH)  | Conditional |
+| Layer     | Model                     | Architecture     | Output Labels                                          | Trigger     |
+|-----------|---------------------------|------------------|--------------------------------------------------------|-------------|
+| Primary   | PTB-XL + MIMIC (Stage 2)  | Inception-1D     | NORM, MI, STTC, HYP, WPW, LNGQT, CD (7 classes)       | Always      |
+| Secondary | Ribeiro ResNet-1D         | ResNet-1D        | 1dAVb, RBBB, LBBB, AF (AFIB), SB (SBRAD), ST (STACH)  | Conditional |
 
 ### 2.2 Threshold Gate Logic
 
@@ -99,18 +99,33 @@ PG/
 +-- ml/
 |   +-- data/
 |   |   +-- ptbxl/                  # PTB-XL WFDB dataset (records100/500, CSVs)
-|   |   +-- ecg_tracings.hdf5       # Test dataset (GIT IGNORED)
+|   |   +-- ecg_tracings.hdf5       # Ribeiro test dataset (GIT IGNORED)
+|   |   +-- mimic_subset_wfdb/      # MIMIC-IV-ECG WFDB subset (500 Hz, GIT IGNORED)
+|   |   |   +-- mimic_wpw_lngqt_subset.csv  # 2,413 curated records (WPW=413, LNGQT=2022)
+|   |   |   +-- files/              # WFDB .hea/.dat records (p1000/.../sXXX/)
+|   |   +-- mimic_processed_400hz/  # Preprocessed MIMIC tensors at 400 Hz (GIT IGNORED)
+|   |       +-- X_train.npy         # (N_train, 4096, 12) float32
+|   |       +-- y_train.npy         # (N_train, 7) labels: 1/0/-1 (unknown)
+|   |       +-- X_test.npy          # (N_test, 4096, 12) float32
+|   |       +-- y_test.npy          # (N_test, 7) labels: 1/0/-1
+|   |       +-- meta_train.csv / meta_test.csv
 |   +-- ptbxl/
-|   |   +-- config.py               # PTB-XL configuration & paths
-|   |   +-- dataset.py              # Metadata loader, splits & signal resampler
-|   |   +-- models.py               # Ribeiro ResNet-1D architecture implementation
-|   |   +-- train.py                # Training orchestrator & callbacks
+|   |   +-- config.py               # PTB-XL configuration & paths (INPUT_LENGTH=4096, 7 classes)
+|   |   +-- dataset.py              # Metadata loader, PTBXLSequence, class weights
+|   |   +-- models.py               # Inception-1D (InceptionTime) + Ribeiro ResNet-1D
+|   |   +-- train.py                # Stage 1 training orchestrator (BinaryFocalLoss)
+|   |   +-- checkpoints/
+|   |       +-- best_model.keras    # Stage 1 checkpoint (PTB-XL only)
+|   |       +-- best_model_stage2b.keras # Stage 2 fine-tuned checkpoint (PTB-XL + MIMIC)
 |   +-- raw/
 |   |   +-- model.hdf5              # Original Ribeiro Keras weights (GIT IGNORED)
 |   +-- scripts/
-|   |   +-- export_dual_onnx.py     # Keras -> Dual ONNX compilation pipeline (Ribeiro)
-|   |   +-- export_ptbxl_dual_onnx.py # Keras -> Dual ONNX compilation pipeline (PTB-XL)
-|   |   +-- export_sample_json.py   # Static JSON fixture generator
+|   |   +-- preprocess_mimic_wpw_lngqt.py # MIMIC signal alignment, resample, 80/20 partition
+|   |   +-- finetune_ptbxl_mimic.py       # Two-stage fine-tuning with MaskedBinaryFocalLoss
+|   |   +-- evaluate_ptbxl_mimic_gradcam.py # Comparative eval & 1D Grad-CAM visualization
+|   |   +-- export_dual_onnx.py           # Keras -> Dual ONNX: Ribeiro model
+|   |   +-- export_ptbxl_dual_onnx.py     # Keras -> Dual ONNX: PTB-XL/MIMIC primary model
+|   |   +-- export_sample_json.py         # Static JSON fixture generator
 |   +-- spikes/
 |       +-- test_inference_cam.py   # Spike 1: ONNX validation and CAM inference
 +-- samples/
@@ -151,17 +166,32 @@ PG/
    - The dense weight matrix is strictly `(5120, 6)`, reshaped to `(16, 320)` for 1D CAM calculations.
    - **Never** change this logic to standard Global Average Pooling.
 
+6. **PTB-XL Primary Model Architecture (Inception-1D with GAP):**
+   - The primary model uses `GlobalAveragePooling1D`, making **1D Grad-CAM** the correct explainability method.
+   - Feature maps shape: `(N, 1024, 128)`. Dense head: `(128, 7)`.
+   - **Never apply Flatten-based CAM or the (5120,6) dense weight reshape to this model.**
+
+7. **MIMIC-IV-ECG Loss Masking:**
+   - MIMIC records set `y_true = -1.0` for all columns except WPW (idx=4) and LNGQT (idx=5).
+   - The `MaskedBinaryFocalLoss` in `ml/scripts/finetune_ptbxl_mimic.py` masks out `-1.0` entries from gradient computation.
+   - **Never train MIMIC records with standard BCE/Focal loss** without this mask — doing so would corrupt the 5 superclass representations.
+
+8. **MIMIC Channel Alignment:**
+   - MIMIC-IV-ECG stores `aVL` and `aVF` in swapped positions relative to PTB-XL.
+   - Always reorder leads by `sig_name` (not by position index) using `MIMIC_TO_PTBXL` mapping in `ml/scripts/preprocess_mimic_wpw_lngqt.py`.
+
 ---
 
 ## 5. Local Execution Pipeline
 
 With the virtual environment active (`.venv`):
 
-1. **Compile the Ribeiro model and extract weights:**
+### 5a. Ribeiro Subordinate Model (Stage 0 — pre-trained)
+1. **Compile Ribeiro model to dual ONNX:**
    ```powershell
    python ml/scripts/export_dual_onnx.py
    ```
-2. **Validate Ribeiro inference and CAM in the console:**
+2. **Validate Ribeiro ONNX inference and CAM:**
    ```powershell
    python ml/spikes/test_inference_cam.py
    ```
@@ -169,8 +199,78 @@ With the virtual environment active (`.venv`):
    ```powershell
    python ml/scripts/export_sample_json.py
    ```
-4. **Launch Canvas viewer:**
+
+### 5b. PTB-XL Primary Model — Stage 1 Training (Inception-1D)
+4. **Train on PTB-XL (folds 1–9, test=fold 10):**
+   ```powershell
+   python -m ml.ptbxl.train --arch inception1d --epochs 50
+   ```
+
+### 5c. PTB-XL + MIMIC Fine-Tuning — Stage 2 (WPW/LNGQT boost)
+5. **Preprocess MIMIC-IV-ECG subset (run once, ~5–10 min):**
+   ```powershell
+   python ml/scripts/preprocess_mimic_wpw_lngqt.py
+   ```
+6. **Two-stage fine-tuning with loss masking:**
+   ```powershell
+   python ml/scripts/finetune_ptbxl_mimic.py --stage AB --epochs-a 15 --epochs-b 20
+   ```
+7. **Comparative evaluation and 1D Grad-CAM plots:**
+   ```powershell
+   python ml/scripts/evaluate_ptbxl_mimic_gradcam.py
+   ```
+8. **Export fine-tuned model to dual ONNX (production):**
+   ```powershell
+   python ml/scripts/export_ptbxl_dual_onnx.py
+   ```
+
+### 5d. Frontend
+9. **Launch Canvas viewer:**
    ```powershell
    python -m http.server 8000
    # Open: http://localhost:8000/frontend/spikes/test_canvas.html
    ```
+
+---
+
+## 6. Stage 2 Training Pipeline — MIMIC-IV-ECG Integration
+
+### 6.1 Dataset Overview
+
+| Property | PTB-XL (Stage 1) | MIMIC-IV-ECG Subset (Stage 2) |
+|---|---|---|
+| Records | 21,837 | 2,413 (413 WPW + 2,022 LNGQT) |
+| Sampling rate | 500 Hz (records100: 100 Hz) | 500 Hz |
+| Input to model | 400 Hz / 4096 samples | 400 Hz / 4096 samples |
+| Lead order | Standard PTB-XL | MIMIC (aVL/aVF swapped → corrected by sig_name) |
+| Supervision scope | Full 7 classes | WPW + LNGQT only (-1.0 for all others) |
+| Split strategy | strat_fold (1-10) | GroupShuffleSplit by subject_id (80/20) |
+
+### 6.2 New Scripts
+
+| Script | Purpose |
+|---|---|
+| ml/scripts/preprocess_mimic_wpw_lngqt.py | WFDB reader, channel alignment, resample_poly, Z-score, GroupShuffleSplit |
+| ml/scripts/finetune_ptbxl_mimic.py | Two-stage fine-tuning: MaskedBinaryFocalLoss, HybridECGSequence, WPW×3 oversample |
+| ml/scripts/evaluate_ptbxl_mimic_gradcam.py | PTB-XL + MIMIC eval, threshold sweep, 1D Grad-CAM plots for WPW/LNGQT |
+
+### 6.3 Execution Checklist
+
+`powershell
+# 1. Preprocess MIMIC (run once)
+python ml/scripts/preprocess_mimic_wpw_lngqt.py
+
+# 2. Fine-tune Stage A + B
+python ml/scripts/finetune_ptbxl_mimic.py --stage AB
+
+# 3. Evaluate & generate CAM plots
+python ml/scripts/evaluate_ptbxl_mimic_gradcam.py
+
+# 4. Export to dual ONNX (update MODEL_PATH to stage2b checkpoint)
+python ml/scripts/export_ptbxl_dual_onnx.py
+`
+
+> [!IMPORTANT]
+> The fine-tuned checkpoint ml/ptbxl/checkpoints/best_model_stage2b.keras is the **production-ready primary model**.
+> The Stage 1 checkpoint ml/ptbxl/checkpoints/best_model.keras is kept as the baseline for comparison.
+> Never commit either checkpoint to git (both are GIT IGNORED via ml/ptbxl/checkpoints/.gitkeep pattern).

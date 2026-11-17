@@ -409,10 +409,7 @@ def main() -> None:
         )
 
     print(f"[*] Loading Stage 1 checkpoint: {stage1_ckpt}")
-    model = tf.keras.models.load_model(
-        stage1_ckpt,
-        custom_objects={"BinaryFocalLoss": BinaryFocalLoss},
-    )
+    model = tf.keras.models.load_model(stage1_ckpt, compile=False)
     print(f"[+] Model loaded. Input: {model.input_shape}  Output: {model.output_shape}")
 
     # ------------------------------------------------------------------
@@ -494,13 +491,7 @@ def main() -> None:
             ckpt_a = os.path.join(STAGE2_CHECKPOINTS_DIR, "best_model_stage2a.keras")
             if os.path.exists(ckpt_a):
                 print(f"\n[*] Reloading best Stage A checkpoint: {ckpt_a}")
-                model = tf.keras.models.load_model(
-                    ckpt_a,
-                    custom_objects={
-                        "BinaryFocalLoss": BinaryFocalLoss,
-                        "MaskedBinaryFocalLoss": MaskedBinaryFocalLoss,
-                    },
-                )
+                model = tf.keras.models.load_model(ckpt_a, compile=False)
 
         unfreeze_last_inception_block(model)
         compile_model(model, lr=2e-4)

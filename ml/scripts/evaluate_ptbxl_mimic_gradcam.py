@@ -386,10 +386,10 @@ def main() -> None:
         )
 
     print(f"[*] Loading Stage 1 checkpoint: {STAGE1_CKPT}")
-    model_s1 = tf.keras.models.load_model(STAGE1_CKPT, custom_objects=custom_objects)
+    model_s1 = tf.keras.models.load_model(STAGE1_CKPT, compile=False)
 
     print(f"[*] Loading Stage 2 checkpoint: {args.stage2_checkpoint}")
-    model_s2 = tf.keras.models.load_model(args.stage2_checkpoint, custom_objects=custom_objects)
+    model_s2 = tf.keras.models.load_model(args.stage2_checkpoint, compile=False)
 
     # ------------------------------------------------------------------
     # 2. Load PTB-XL Val + Test splits (for threshold calibration + eval)
